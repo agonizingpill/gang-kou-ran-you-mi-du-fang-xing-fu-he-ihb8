@@ -10,7 +10,11 @@ from .constants import GRADES
 
 def now():return datetime.now(timezone.utc).isoformat()
 def capacity_view(s,x):return {**obj(x),'tank_code':s.get(Tank,x.tank_id).code}
-def receipt_view(s,x):return {**obj(x),'tank_code':s.get(Tank,x.tank_id).code}
+def receipt_view(s,x):
+    from .batch_models import TankBatch
+    batch=s.scalar(select(TankBatch).where(TankBatch.receipt_id==x.id))
+    return {**obj(x),'tank_code':s.get(Tank,x.tank_id).code,'batch_code':batch.code if batch else '',
+            'superseded_by_code':s.get(TankBatch,batch.superseded_by_id).code if batch and batch.superseded_by_id else ''}
 def recon_view(s,x):return {**obj(x),'transfer_code':s.get(Transfer,x.transfer_id).code}
 def capacity(s,data,u):
     tank=get(s,Tank,data.tank_id,True)
@@ -18,7 +22,11 @@ def capacity(s,data,u):
     if data.capacity_liters<tank.liters:raise HTTPException(409,'罐容不能小于当前存油量')
     spec=GRADES[tank.grade]
     if not spec['density_min']<=data.density_15<=spec['density_max']:raise HTTPException(409,'初始存油密度不在储罐等级范围内')
-    x=TankCapacity(**data.model_dump());s.add(x);s.flush();audit(s,u,'capacity_registered',tank.code);return capacity_view(s,x)
+    x=TankCapacity(**data.model_dump());s.add(x);s.flush()
+    from .batch_service import ensure_active_batch
+    batch=ensure_active_batch(s,tank,lock=True)
+    if batch.source=='legacy':batch.density_15=data.density_15;batch.note='主管固定罐容与初始存油密度基准'
+    audit(s,u,'capacity_registered',tank.code);return {**capacity_view(s,x),'batch_code':batch.code}
 def verify(s,x):
     tank=get(s,Tank,x.tank_id)
     if x.grade!=tank.grade:raise HTTPException(409,'到港油品等级与接收储罐不一致')
@@ -39,9 +47,12 @@ def receive(s,id,u):
     before=t.liters;after=before+x.liters
     if after>c.capacity_liters:raise HTTPException(409,'到港入量超过储罐剩余罐容，未改变存量')
     old_density=c.density_15;weighted=((before*old_density+x.liters*x.density_15)/after).quantize(Decimal('.001'))
+    from .batch_service import apply_receipt_batch
+    batch,superseded=apply_receipt_batch(s,t,x,after,weighted)
     t.liters=after;c.density_15=weighted;x.state='received';x.received_by=u['email']
-    x.receipt_snapshot={'code':x.code,'tank_code':t.code,'grade':t.grade,'before_liters':float(before),'receipt_liters':float(x.liters),'after_liters':float(after),'capacity_liters':float(c.capacity_liters),'before_density_15':float(old_density),'arrival_density_15':float(x.density_15),'weighted_density_15':float(weighted),'received_by':u['email'],'at':now(),'density_formula':'(before_liters * before_density + receipt_liters * arrival_density) / after_liters'}
-    audit(s,u,'receipt_received',x.code+' / '+str(x.liters)+'L');return receipt_view(s,x)
+    x.receipt_snapshot={'code':x.code,'tank_code':t.code,'grade':t.grade,'before_liters':float(before),'receipt_liters':float(x.liters),'after_liters':float(after),'capacity_liters':float(c.capacity_liters),'before_density_15':float(old_density),'arrival_density_15':float(x.density_15),'weighted_density_15':float(weighted),'received_by':u['email'],'at':now(),'density_formula':'(before_liters * before_density + receipt_liters * arrival_density) / after_liters','new_batch_code':batch.code,'superseded_batch_code':superseded.code if superseded else None,'invalidated':bool(superseded)}
+    audit(s,u,'receipt_received',x.code+' / '+str(x.liters)+'L / '+batch.code+(' 新批次' if superseded else ' 首批'))
+    return receipt_view(s,x)
 def reconciliation(s,data,u):
     tr=get(s,Transfer,data.transfer_id,True)
     if tr.status!='released':raise HTTPException(409,'只有已放行调拨单可以做实船计量对账')
